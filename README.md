@@ -1,109 +1,114 @@
-# Práctica 4 — Sistemas Embebidos: UART bidireccional (PC ↔ FPGA)
+# Practice 4: Bidirectional UART Communication
 
-Comunicación serie bidireccional entre una PC y una FPGA DE10-Lite mediante UART,
-con un módulo ESP32 functioning as puente USB-UART. La FPGA recibe un byte, le suma
-1 y lo retransmite.
+This project implements a serial communication link between a computer and an
+Intel/Altera DE10-Lite FPGA. An ESP32 bridges the computer's USB serial connection
+to the FPGA's UART. The FPGA receives one byte, increments it, and sends the
+result back to the computer through the ESP32.
 
-**Especificación original:** `practica4_v2_sistemas_embebidos.pdf` (UDLAP, 14 pp.).
+## Assignment objective
 
-## Arquitectura
+Design, implement, and test a bidirectional UART system using:
 
+- A DE10-Lite FPGA running at 50 MHz
+- An ESP32 acting as a transparent USB-to-UART bridge
+- MATLAB scripts on the computer to send and receive data
+
+The FPGA must receive serial data, process at least one byte, and transmit a
+response. This implementation returns the received byte plus one. Because the
+result is an 8-bit value, sending `255` produces `0`.
+
+## Communication requirements
+
+- UART format: **9600 baud, 8 data bits, no parity, 1 stop bit (8N1)**
+- FPGA clock: **50 MHz**
+- FPGA clock cycles per UART bit: approximately `50,000,000 / 9,600 = 5,208`
+- The ESP32 forwards bytes in both directions without changing them.
+- TX and RX must be crossed between the ESP32 and FPGA, and both devices must
+  share a common ground.
+- The DE10-Lite and ESP32 use 3.3 V logic. Do not connect classic RS-232 voltage
+  levels directly to FPGA GPIO pins.
+
+## System architecture
+
+```text
+Computer / MATLAB
+        |
+        | USB serial
+        v
+ESP32 USB-UART bridge
+        |
+        | UART2, 9600 baud, 8N1
+        v
+DE10-Lite FPGA: receive byte -> add 1 -> transmit response
 ```
-PC ──USB── ESP32 (puente) ──UART── FPGA (DE10-Lite)
-               9600 8N1           9600 8N1
-```
 
-- La PC se comunica con el ESP32 por USB (puerto serie virtual).
-- El ESP32 retransmite por una segunda UART hardware hacia la FPGA.
-- La FPGA responde por UART al ESP32, que la reenvía a la PC.
-- Niveles lógicos: ESP32 y FPGA operan a **3.3 V**, por lo que la interconexión es
-  directa. Es indispensable **tierra común** entre FPGA y ESP32.
-- Conexión cruzada: TX del ESP32 → RX de la FPGA, RX del ESP32 → TX de la FPGA.
+Connect the ESP32's GPIO17 (TX) to the FPGA UART RX, GPIO16 (RX) to the FPGA
+UART TX, and GND to GND. Select the ESP32's assigned COM port in the computer
+script.
 
-Formato: **9600 baudios, 8 bits, sin paridad, 1 bit de paro (8N1)**.
-Con el reloj de 50 MHz de la FPGA: `N = 50_000_000 / 9600 ≈ 5208` ciclos por bit.
+## Source files
 
-## Estructura
+| File | Purpose |
+|---|---|
+| `src/top_uart_de10lite.v` | FPGA top-level module; receives a byte and starts transmission of the incremented result. |
+| `src/uart_rx.v` | UART receiver for the FPGA. |
+| `src/uart_tx.v` | UART transmitter for the FPGA. |
+| `src/tb_top_uart.v` | Testbench that sends five sample bytes and checks the responses. |
+| `src/esp32_puente/esp32_puente.ino` | ESP32 firmware that bridges USB serial and UART2. |
+| `src/bidireccional_matlab.m` | MATLAB script for sending a byte and displaying the response. |
+| `src/transmision_matlab.m` | MATLAB transmit-only example. |
+| `src/recepcion_matlab.m` | MATLAB receive-only example. |
+| `src/comunicacion_serial.py` | Optional Python serial client for sending a byte and reading the response. |
 
-```
-src/
-├── top_uart_de10lite.v      # Módulo superior de la FPGA (instancia RX + TX)
-├── uart_rx.v                # Receptor UART 8N1 (FSM de 4 estados + sincronizador)
-├── uart_tx.v                # Transmisor UART 8N1
-├── tb_top_uart.v            # Testbench: envía 5 bytes y verifica byte+1
-├── esp32_puente/
-│   └── esp32_puente.ino     # Firmware ESP32: puente transparente PC ↔ FPGA
-├── comunicacion_serial.py    # Script Python (PC) de comunicación bidireccional
-├── transmision_matlab.m     # Script MATLAB: solo transmite
-├── recepcion_matlab.m       # Script MATLAB: solo recibe
-└── bidireccional_matlab.m   # Script MATLAB: transmite y recibe (byte+1)
-```
+## Setup and operation
 
-## FPGA (DE10-Lite, 50 MHz)
+1. In Quartus Prime, assign the top-level module's clock, reset, UART RX, and
+   UART TX signals to the appropriate DE10-Lite pins, then compile and program
+   the FPGA.
+2. Open `src/esp32_puente/esp32_puente.ino` in Arduino IDE, select the
+   appropriate ESP32 board and COM port, and upload the bridge firmware.
+3. Wire the ESP32 and FPGA as described above, including the shared ground.
+4. In the MATLAB script, change `PORT` to the COM port assigned to the ESP32.
+   Run `src/bidireccional_matlab.m`, enter a value from 0 to 255, and verify
+   that the response is one greater (wrapping from 255 to 0).
 
-- **`uart_rx`** : sincronizador de 2 FF para la línea `rx` asincrónica; FSM de 4
-  estados (`IDLE → START → DATA → STOP`). Muestrea el start bit a medio bit y los 8
-  datos en el centro de cada bit (LSB primero); solo entrega el byte si el stop bit
-  es 1. Es la versión **corregida** de la práctica: la del PDF original carece de
-  sincronizador y de verificación de stop bit.
-- **`uart_tx`** : transmite start bit (0), 8 datos y stop bit (1). La línea inicia
-  en alto (`1'b1`) y el shift register se carga con `{1'b1, data_in, 1'b0}`.
-- **`top_uart_de10lite`** : cuando `rx_done` y la línea no está ocupada (`!tx_busy`),
-  calcula `rx_data + 8'd1` y dispara la transmisión. (Nota: en el PDF original
-  `rx_done` se declara como `wire [7:0]`, error corregido aquí a `wire`.)
-
-## ESP32
-
-Pines: `FPGA_RX_PIN = 16` (RX del ESP32 ← TX de la FPGA),
-`FPGA_TX_PIN = 17` (TX del ESP32 → RX de la FPGA). Usa `HardwareSerial FPGA_Serial(2)`.
-El loop copia byte a byte en ambas direcciones (`Serial ↔ FPGA_Serial`), comportamiento
-de puente transparente.
-
-## Scripts de PC
-
-- **Python** (`comunicacion_serial.py`): envía un byte (0–255) por `COM3` y lee la
-  respuesta. Usa `pyserial`. Valida rango y tipo de entrada.
-- **MATLAB** (`bidireccional_matlab.m`): mismo flujo con `serialport`. Los scripts
-  `transmision_matlab.m` y `recepcion_matlab.m` son versiones unidireccionales.
-
-Las versiones de los scripts son **mejoradas** respecto al PDF original: validan que la
-entrada sea entero (rechazan `12.5`), esperan la respuesta con un timeout de 1 s en
-lugar de un `pause(0.1)` fijo, y descartan bytes viejos (`flush`) antes de cada envío.
-
-Cambia `PORT` / `COM3` / `COM7` según tu puerto real (debe ser el asignado al ESP32).
-
-## Tabla de pruebas (especificación, sección 19)
-
-| Dato enviado | Esperado | Comentario |
-|-------------|----------|------------|
-| 10 | 11 | Incremento en 1 |
-| 25 | 26 | Incremento en 1 |
-| 100 | 101 | Incremento en 1 |
-| 200 | 201 | Incremento en 1 |
-| 255 | 0 | Caso límite: `255 + 1 = 0` en 8 bits |
+The optional Python client requires `pyserial`; install it with `pip install
+pyserial`, update `PORT` in `src/comunicacion_serial.py`, and run the script.
+Close other applications that may have the ESP32 COM port open before running
+either client.
 
 ## Testbench
 
-`tb_top_uart.v` envía `{10, 25, 100, 200, 255}` y verifica que la FPGA responda
-`byte + 1`. Espera `TODAS LAS PRUEBAS PASARON`.
+The testbench checks the following expected results:
 
-## Cómo probar la FPGA
+| Byte sent | Expected response |
+|---:|---:|
+| 10 | 11 |
+| 25 | 26 |
+| 100 | 101 |
+| 200 | 201 |
+| 255 | 0 |
 
-```bash
-# Con ModelSim / Quartus
+For ModelSim or Questa, compile and run from the `src` directory:
+
+```tcl
 vlog tb_top_uart.v top_uart_de10lite.v uart_rx.v uart_tx.v
 vsim tb_top_uart
+run -all
 ```
 
-## Entrega del estudiante (sección 20)
+The simulation reports whether each byte passed and prints
+`TODAS LAS PRUEBAS PASARON` when all five checks succeed.
 
-Capturas de simulación del transmisor y receptor, evidencia de la conexión física
-FPGA–ESP32, capturas del monitor serial y de la consola de MATLAB, fotografías del
-funcionamiento experimental y comparación entre resultados esperados y obtenidos.
+## Assignment report
 
-## Notas
+The assignment asks for evidence and discussion of the completed system. Include:
 
-- Los archivos `.bak` son copias de seguridad de versiones anteriores y no forman
-  parte del diseño (están en `.gitignore`).
-- El PDF contiene la especificación original de la práctica; esta README describe la
-  versión implementada de los archivos, que incluye correcciones y mejoras.
+- UART transmitter and receiver simulation results
+- Photos or evidence of the FPGA-to-ESP32 and ESP32-to-computer connections
+- Evidence that the ESP32 bridge firmware was uploaded
+- MATLAB screenshots showing transmitted and received values
+- A comparison of expected and measured results, plus conclusions about baud
+  rate agreement and the ESP32's role as a USB-UART bridge
+- Answers to the assignment questions about UART versus RS-232, voltage levels,
+  baud rate, crossed TX/RX wiring, MATLAB, and the ESP32 bridge
